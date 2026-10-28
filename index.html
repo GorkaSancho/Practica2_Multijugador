@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Duelo de Flechas</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=Figtree:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <div>
+        <h1>Duelo de Flechas</h1>
+        <p class="mode">Entrenamiento · un jugador</p>
+      </div>
+      <div class="clock">
+        <div class="label">Tiempo</div>
+        <div class="time" id="clock">0.0 s</div>
+      </div>
+    </header>
+
+    <section class="board" aria-label="Tablero">
+      <div class="score">
+        <div class="pips" id="pips"></div>
+        <div class="count" id="count">0 / 5</div>
+      </div>
+      <div class="stage" id="stage" role="img" aria-label="Combinación de flechas"></div>
+      <p class="status" id="status" aria-live="polite"></p>
+      <div class="pad" id="pad"></div>
+      <div class="overlay" id="overlay"></div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
