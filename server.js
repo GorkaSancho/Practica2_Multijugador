@@ -127,7 +127,7 @@ const server = http.createServer(async (req, res) => {
     });
     p.res = res;
     send(res, 'players', scoreboard(room));
-    req.on('close', () => { p.res = null; });
+    res.on('close', () => { p.res = null; });
     return;
   }
 
