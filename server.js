@@ -27,6 +27,7 @@ const MAX_LEN = 12;    // mida màxima
 const GRACE_MS = 120;  // finestra de gràcia: qui arriba dins d'aquest temps també puntua
 const START_MS = 3000; // compte enrere abans de la primera ronda
 const DIRS = ['up', 'down', 'left', 'right'];
+const MAX_PLAYERS = 10; // màxim de jugadors per sala
 
 /** Sales actives: codi → { state, players, round, combo, winners }. Viuen només a la memòria. */
 const rooms = new Map();
@@ -132,7 +133,11 @@ const server = http.createServer(async (req, res) => {
   // Entrar a la sala
   if (action === 'join' && req.method === 'POST') {
     if (room.state !== 'lobby') return json(res, 409, { error: 'partida ja començada' });
+    if (room.players.size >= MAX_PLAYERS) return json(res, 409, { error: 'sala plena (màxim 10 jugadors)' });
     const { name } = await readBody(req);
+    // Torna a comprovar després de llegir el cos per evitar superar el límit amb entrades simultànies.
+    if (room.state !== 'lobby') return json(res, 409, { error: 'partida ja començada' });
+    if (room.players.size >= MAX_PLAYERS) return json(res, 409, { error: 'sala plena (màxim 10 jugadors)' });
     const id = randomUUID(); // impossible d'endevinar: fa de credencial
     room.players.set(id, { id, name: String(name || 'Jugador').slice(0, 20), score: 0, res: null });
     broadcast(room, 'players', scoreboard(room));
