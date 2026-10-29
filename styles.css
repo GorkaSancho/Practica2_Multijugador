@@ -1,10 +1,12 @@
-/* Layout: una columna. Cabecera con título y reloj; tablero con barra de puntos,
-   combinación en fichas y mando en pantalla. Inicio, cuenta atrás y resultado
-   se superponen al tablero. */
+/* Disseny: una columna. Capçalera amb títol i rellotge; tauler amb barra de punts,
+   combinació en fitxes i comandament en pantalla. L'inici, el compte enrere i el
+   resultat se superposen al tauler. Al mode en línia hi ha la classificació a la dreta. */
 
 img { max-width: 100%; }
+/* .overlay té display:flex, que guanyaria a l'estil per defecte de [hidden]; per això el forcem */
 [hidden]:not([hidden=until-found i]) { display: none !important; }
 
+/* Tema clar: tots els colors i mides són variables (--nom) que s'usen amb var(--nom) */
 :root {
   color-scheme: light;
   box-sizing: border-box;
@@ -30,6 +32,7 @@ img { max-width: 100%; }
   --tile: clamp(40px, 11.5vw, 72px);
   --gap: clamp(6px, 1.6vw, 12px);
 }
+/* Tema fosc automàtic segons la preferència del sistema */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #0E1120;
@@ -48,6 +51,7 @@ img { max-width: 100%; }
     color-scheme: dark;
   }
 }
+/* Tema fosc forçat (si algun dia s'hi afegeix un botó) */
 :root[data-theme="dark"] {
   --bg: #0E1120;
   --surface: #171B30;
@@ -90,7 +94,7 @@ body {
   gap: 16px;
 }
 
-/* ── Cabecera ── */
+/* ── Capçalera ── */
 .top {
   display: flex;
   flex-wrap: wrap;
@@ -130,7 +134,7 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
-/* ── Tablero ── */
+/* ── Tauler ── */
 .board {
   position: relative;
   min-width: 0;
@@ -167,7 +171,7 @@ h1 {
   color: var(--muted);
 }
 
-/* ── Fichas ── */
+/* ── Fitxes (cada fletxa de la combinació) ── */
 .stage {
   min-height: calc(var(--tile) * 2 + var(--gap));
   display: flex;
@@ -196,6 +200,7 @@ h1 {
   stroke-linejoin: round;
 }
 .tile svg { width: 58%; height: 58%; }
+/* Una sola fletxa dibuixada cap amunt; es gira segons data-dir */
 [data-dir="right"] svg { transform: rotate(90deg); }
 [data-dir="down"] svg { transform: rotate(180deg); }
 [data-dir="left"] svg { transform: rotate(270deg); }
@@ -227,7 +232,7 @@ h1 {
 .status.good { color: var(--good); }
 .status.bad { color: var(--bad); }
 
-/* ── Mando en pantalla ── */
+/* ── Comandament en pantalla (graella 3×2 amb les quatre fletxes) ── */
 .pad {
   --key: clamp(48px, 14vw, 60px);
   display: grid;
@@ -257,7 +262,7 @@ h1 {
 .key[data-dir="right"] { grid-area: right; }
 .key.hit { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
-/* ── Pantallas superpuestas ── */
+/* ── Pantalles superposades (inici, compte enrere, resultat, menú en línia) ── */
 .overlay {
   position: absolute;
   inset: 0;
@@ -323,7 +328,8 @@ h1 {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 
-/* ── Online ── */
+/* ── Mode en línia: disseny amb classificació, botons secundaris i camps de text ── */
+/* El tauler ocupa l'espai sobrant; la classificació passa a sota si no hi cap */
 .layout { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
 .layout .board { flex: 1 1 480px; }
 .side {
