@@ -28,6 +28,8 @@ const GRACE_MS = 120;  // finestra de gràcia: qui arriba dins d'aquest temps ta
 const START_MS = 3000; // compte enrere abans de la primera ronda
 const DIRS = ['up', 'down', 'left', 'right'];
 const MAX_PLAYERS = 10; // màxim de jugadors per sala
+const MAX_ROOMS = 100;  // màxim de sales simultànies per procés
+const ROOM_TTL_MS = 5 * 60 * 1000; // caducitat de sales i jugadors desconnectats
 
 /** Sales actives: codi → { state, players, round, combo, winners }. Viuen només a la memòria. */
 const rooms = new Map();
@@ -61,15 +63,20 @@ function startRound(room, scorers = []) {
   room.round++;
   room.combo = newCombo();
   room.winners = null; // ningú ha acabat encara aquesta ronda
+  room.lastScorers = scorers;
   broadcast(room, 'round', { round: room.round, combo: room.combo, scores: scoreboard(room), scorers });
 }
 
 /** Acaba la finestra de gràcia: puntua els qui han arribat i decideix si hi ha guanyador. */
 function closeRound(room, round) {
-  if (room.round !== round) return; // temporitzador d'una ronda antiga
+  if (rooms.get(room.code) !== room || room.state !== 'playing' || room.round !== round || !room.winners)
+    return; // sala esborrada, partida acabada o temporitzador d'una ronda antiga
 
   const scorers = [...room.winners];
-  for (const id of scorers) room.players.get(id).score++;
+  for (const id of scorers) {
+    const player = room.players.get(id);
+    if (player) player.score++;
+  }
 
   const scores = scoreboard(room);
   const top = Math.max(...scores.map((s) => s.score));
@@ -79,6 +86,47 @@ function closeRound(room, round) {
   } else {
     startRound(room, scorers);
   }
+}
+
+/** Elimina jugadors i sales inactius; conserva els jugadors desconnectats durant el període de reconexió. */
+function pruneRooms(now = Date.now()) {
+  for (const [code, room] of rooms) {
+    let playersChanged = false;
+    for (const [id, player] of room.players) {
+      if (!player.res && player.disconnectedAt && now - player.disconnectedAt >= ROOM_TTL_MS) {
+        room.players.delete(id);
+        room.winners?.delete(id);
+        room.lastScorers = room.lastScorers.filter((scorer) => scorer !== id);
+        playersChanged = true;
+      }
+    }
+    if (playersChanged && room.players.size) broadcast(room, 'players', scoreboard(room));
+
+    const connected = [...room.players.values()].some((player) => player.res && !player.res.destroyed);
+    if (!connected && now - room.lastActivity >= ROOM_TTL_MS) rooms.delete(code);
+  }
+}
+
+/** Estat actual d'una sala, enviat en obrir o reprendre un canal SSE. */
+function sendRoomState(res, room) {
+  send(res, 'players', scoreboard(room));
+  if (room.state === 'lobby') return;
+  if (room.state === 'playing' && room.round === 0) {
+    send(res, 'start', { startsIn: Math.max(0, room.startAt - Date.now()) });
+    return;
+  }
+  if (room.state === 'playing') {
+    send(res, 'round', {
+      round: room.round,
+      combo: room.combo,
+      scores: scoreboard(room),
+      scorers: room.lastScorers.filter((id) => room.players.has(id)),
+    });
+    return;
+  }
+  const scores = scoreboard(room);
+  const top = Math.max(...scores.map((player) => player.score));
+  send(res, 'gameOver', { scores, winners: scores.filter((player) => player.score === top).map((player) => player.id) });
 }
 
 // ── HTTP ─────────────────────────────────────────────────────
@@ -122,8 +170,21 @@ const server = http.createServer(async (req, res) => {
 
   // Crear sala
   if (!code && req.method === 'POST') {
-    const newCode = Math.random().toString(36).slice(2, 8).toUpperCase();
-    rooms.set(newCode, { state: 'lobby', players: new Map(), round: 0, combo: [], winners: null });
+    pruneRooms();
+    if (rooms.size >= MAX_ROOMS) return json(res, 503, { error: 'servidor ple, torna-ho a provar més tard' });
+    let newCode;
+    do { newCode = Math.random().toString(36).slice(2, 8).toUpperCase(); } while (rooms.has(newCode));
+    rooms.set(newCode, {
+      code: newCode,
+      state: 'lobby',
+      players: new Map(),
+      round: 0,
+      combo: [],
+      winners: null,
+      lastScorers: [],
+      startAt: 0,
+      lastActivity: Date.now(),
+    });
     return json(res, 201, { code: newCode });
   }
 
@@ -139,19 +200,63 @@ const server = http.createServer(async (req, res) => {
     if (room.state !== 'lobby') return json(res, 409, { error: 'partida ja començada' });
     if (room.players.size >= MAX_PLAYERS) return json(res, 409, { error: 'sala plena (màxim 10 jugadors)' });
     const id = randomUUID(); // impossible d'endevinar: fa de credencial
-    room.players.set(id, { id, name: String(name || 'Jugador').slice(0, 20), score: 0, res: null });
+    room.players.set(id, {
+      id,
+      name: String(name || 'Jugador').slice(0, 20),
+      score: 0,
+      res: null,
+      disconnectedAt: Date.now(),
+    });
+    room.lastActivity = Date.now();
     broadcast(room, 'players', scoreboard(room));
     return json(res, 200, { playerId: id });
+  }
+
+  // Sortir de la sala i alliberar la plaça del jugador.
+  if (action === 'leave' && req.method === 'POST') {
+    const { player: id } = await readBody(req);
+    const player = room.players.get(id);
+    if (!player) return json(res, 404, { error: 'jugador desconegut' });
+    room.players.delete(id);
+    room.winners?.delete(id);
+    room.lastScorers = room.lastScorers.filter((scorer) => scorer !== id);
+    if (player.res) {
+      const resToClose = player.res;
+      player.res = null;
+      resToClose.end();
+    }
+    room.lastActivity = Date.now();
+    if (!room.players.size) {
+      rooms.delete(code);
+      return json(res, 200, { ok: true });
+    }
+    broadcast(room, 'players', scoreboard(room));
+    return json(res, 200, { ok: true });
   }
 
   // Canal SSE: la resposta es deixa oberta i es guarda al jugador per escriure-hi més tard
   if (action === 'events' && req.method === 'GET') {
     const p = room.players.get(url.searchParams.get('player'));
     if (!p) return json(res, 404, { error: 'jugador desconegut' });
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+    p.res?.end(); // només es manté un canal obert per jugador
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
     p.res = res;
-    send(res, 'players', scoreboard(room));
-    res.on('close', () => { p.res = null; }); // el client s'ha desconnectat
+    p.disconnectedAt = null;
+    room.lastActivity = Date.now();
+    res.flushHeaders();
+    sendRoomState(res, room);
+    res.on('close', () => {
+      if (p.res === res) {
+        p.res = null;
+        p.disconnectedAt = Date.now();
+        room.lastActivity = p.disconnectedAt;
+      }
+    }); // conserva el jugador durant el període de reconnexió
     return;
   }
 
@@ -159,8 +264,12 @@ const server = http.createServer(async (req, res) => {
   if (action === 'start' && req.method === 'POST') {
     if (room.state !== 'lobby') return json(res, 409, { error: 'ja començada' });
     room.state = 'playing';
+    room.lastActivity = Date.now();
+    room.startAt = Date.now() + START_MS;
     broadcast(room, 'start', { startsIn: START_MS });
-    setTimeout(() => startRound(room), START_MS);
+    setTimeout(() => {
+      if (rooms.get(code) === room && room.state === 'playing') startRound(room);
+    }, START_MS);
     return json(res, 200, { ok: true });
   }
 
@@ -172,6 +281,7 @@ const server = http.createServer(async (req, res) => {
     if (room.state !== 'playing' || round !== room.round) return json(res, 409, { error: 'tard' });
     if (!Array.isArray(presses) || presses.join() !== room.combo.join())
       return json(res, 400, { error: 'seqüència incorrecta' });
+    room.lastActivity = Date.now();
 
     if (!room.winners) { // el primer que arriba obre la finestra de gràcia
       room.winners = new Set();
@@ -185,14 +295,13 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { error: 'no existeix' });
 });
 
-// Cada 15 s: comentari SSE (":") perquè les connexions no es tanquin per inactivitat,
-// i esborra les sales on tothom s'ha desconnectat.
+// Cada 15 s: comentari SSE (":") per mantenir les connexions obertes i neteja d'inactivitat.
 setInterval(() => {
   for (const [code, room] of rooms) {
     const open = [...room.players.values()].filter((p) => p.res);
     open.forEach((p) => p.res.write(':\n\n'));
-    if (room.players.size && !open.length) rooms.delete(code);
   }
+  pruneRooms();
 }, 15000);
 
 const PORT = process.env.PORT || 3000;

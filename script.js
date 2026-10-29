@@ -219,7 +219,7 @@
     online: () => showOnlineMenu(),
     create: () => enterRoom(true),
     join: () => enterRoom(false),
-    start: () => api(`/rooms/${online.code}/start`).catch(() => {}),
+    start: () => startOnline(),
   };
   overlayEl.addEventListener('click', (e) => {
     ACTIONS[e.target.closest('[data-action]')?.dataset.action]?.();
@@ -362,7 +362,12 @@
   /** POST amb JSON al servidor. Retorna la resposta o rebutja amb el missatge d'error del servidor. */
   const api = (path, body = {}) =>
     fetch(SERVER + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      .then((r) => r.json().then((d) => (r.ok ? d : Promise.reject(new Error(d.error)))));
+      .then((r) => r.json().then((d) => {
+        if (r.ok) return d;
+        const error = new Error(d.error || 'Error del servidor');
+        error.status = r.status;
+        throw error;
+      }));
 
   /** Punts del jugador local segons l'últim marcador rebut. */
   const myScore = () => online.scores.find((s) => s.id === online.id)?.score ?? 0;
@@ -378,6 +383,13 @@
 
   /** Tanca la connexió en línia i ho deixa tot a punt per al mode Entrenament. */
   function leaveOnline() {
+    const current = online;
+    if (current) {
+      api(`/rooms/${current.code}/leave`, { player: current.id }).catch((err) => {
+        console.error('No s’ha pogut sortir de la sala:', err);
+        setStatus('No s’ha pogut sortir de la sala. Comprova la connexió.', 'bad');
+      });
+    }
     online?.es?.close();
     online = null;
     clearTimeout(timer);
@@ -402,9 +414,19 @@
   function renderLobby() {
     showOverlay(
       `<h2>Sala ${esc(online.code)}</h2>` +
-      `<p>Comparteix el codi. Jugadors connectats: ${online.scores.length}</p>` +
+      `<p>Comparteix el codi. Jugadors a la sala: ${online.scores.length} / 10</p>` +
       '<button class="btn" data-action="start">Comença</button>'
     );
+  }
+
+  /** Comença la partida i mostra qualsevol error retornat pel servidor o la xarxa. */
+  async function startOnline() {
+    try {
+      await api(`/rooms/${online.code}/start`);
+    } catch (err) {
+      console.error('No s’ha pogut començar la partida:', err);
+      setStatus(`No s’ha pogut començar: ${err.message}.`, 'bad');
+    }
   }
 
   /**
@@ -455,6 +477,7 @@
     });
 
     on('start', (d) => {
+      clearTimeout(timer);
       phase = 'countdown';
       clockEl.textContent = '0.0 s';
       renderPips(0);
@@ -492,8 +515,17 @@
       );
     });
 
-    // Si el navegador ha tancat el canal definitivament (p. ex. servidor aturat)
-    es.onerror = () => { if (es.readyState === EventSource.CLOSED) setStatus('Connexió perduda', 'bad'); };
+    let reconnecting = false;
+    es.onopen = () => {
+      if (reconnecting) setStatus('Connexió restablerta', 'good');
+      reconnecting = false;
+    };
+    es.onerror = () => {
+      reconnecting = true;
+      setStatus(es.readyState === EventSource.CLOSED
+        ? 'Connexió perduda'
+        : 'Connexió interrompuda; reconnectant…', 'bad');
+    };
   }
 
   /**
@@ -508,8 +540,16 @@
     if (o.pos < o.combo.length) return;
     phase = 'waiting'; // fins que arribi la ronda següent
     setStatus('Completada! Esperant el servidor…', 'good');
-    // Si arriba tard el servidor respon 409; no cal fer res: la ronda nova ja arribarà per SSE
-    api(`/rooms/${o.code}/complete`, { player: o.id, round: o.round, presses: o.presses }).catch(() => {});
+    // El servidor respon 409 si la ronda ja ha canviat; la ronda nova arribarà per SSE.
+    api(`/rooms/${o.code}/complete`, { player: o.id, round: o.round, presses: o.presses }).catch((err) => {
+      if (online !== o || (err.status === 409 && err.message === 'tard')) return;
+      console.error('No s’ha pogut enviar la jugada:', err);
+      o.pos = 0;
+      o.presses = [];
+      updateTiles(0);
+      phase = 'playing';
+      setStatus(`No s’ha pogut enviar la jugada: ${err.message}. Torna-ho a provar.`, 'bad');
+    });
   }
 
   // ── Teclat ────────────────────────────────────────────────
