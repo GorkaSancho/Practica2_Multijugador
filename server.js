@@ -11,6 +11,8 @@
 // Eventos SSE: players | start | round | gameOver
 const http = require('node:http');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const CONFIG = { target: 5, minLen: 4, maxLen: 12, graceMs: 120, startDelayMs: 3000 };
 const DIRS = ['up', 'down', 'left', 'right'];
@@ -50,17 +52,18 @@ function broadcast(room, event, data) {
 }
 
 // ── Rondas ───────────────────────────────────────────────────
-function startRound(room) {
+function startRound(room, scorers = []) {
   room.round++;
   room.combo = newCombo(room);
   room.winners = null;
-  broadcast(room, 'round', { round: room.round, combo: room.combo, scores: scoreboard(room) });
+  broadcast(room, 'round', { round: room.round, combo: room.combo, scores: scoreboard(room), scorers });
 }
 
 // Se llama al acabar la ventana de gracia: reparte puntos y decide si hay ganador
 function closeRound(room, round) {
   if (room.round !== round || room.state !== 'playing') return;
-  for (const id of room.winners) room.players.get(id).score++;
+  const scorers = [...room.winners]; // quién ha puntuado en esta ronda
+  for (const id of scorers) room.players.get(id).score++;
   const scores = scoreboard(room);
   const top = Math.max(...scores.map((s) => s.score));
   if (top >= CONFIG.target) {
@@ -68,7 +71,7 @@ function closeRound(room, round) {
     const winners = scores.filter((s) => s.score === top).map((s) => s.id);
     broadcast(room, 'gameOver', { scores, winners });
   } else {
-    startRound(room);
+    startRound(room, scorers);
   }
 }
 
@@ -89,6 +92,17 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return res.writeHead(204).end();
 
   const url = new URL(req.url, 'http://localhost');
+
+  // Archivos del juego (el servidor también sirve la web)
+  const FILES = { '/': ['index.html', 'text/html'], '/styles.css': ['styles.css', 'text/css'], '/script.js': ['script.js', 'text/javascript'] };
+  if (req.method === 'GET' && FILES[url.pathname]) {
+    const [file, type] = FILES[url.pathname];
+    return fs.readFile(path.join(__dirname, file), (err, data) => {
+      if (err) return json(res, 500, { error: 'no se pudo leer ' + file });
+      res.writeHead(200, { 'Content-Type': type + '; charset=utf-8' });
+      res.end(data);
+    });
+  }
   const [root, code, action] = url.pathname.split('/').filter(Boolean);
   if (root !== 'rooms') return json(res, 404, { error: 'no existe' });
 

@@ -14,7 +14,7 @@
     <header class="top">
       <div>
         <h1>Duelo de Flechas</h1>
-        <p class="mode">Entrenamiento · un jugador</p>
+        <p class="mode" id="mode">Entrenamiento · un jugador</p>
       </div>
       <div class="clock">
         <div class="label">Tiempo</div>
@@ -22,6 +22,7 @@
       </div>
     </header>
 
+    <div class="layout">
     <section class="board" aria-label="Tablero">
       <div class="score">
         <div class="pips" id="pips"></div>
@@ -32,6 +33,8 @@
       <div class="pad" id="pad"></div>
       <div class="overlay" id="overlay"></div>
     </section>
+    <aside class="side" id="side" hidden></aside>
+    </div>
   </main>
 
   <script src="script.js"></script>

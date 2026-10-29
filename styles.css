@@ -322,3 +322,47 @@ h1 {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ── Online ── */
+.layout { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.layout .board { flex: 1 1 480px; }
+.side {
+  flex: 0 1 200px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.side h2 {
+  margin: 0 0 12px;
+  font: 800 1.1rem var(--font-display);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.side ol { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.side li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1.5px solid var(--line);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.side li.me { border-color: var(--accent); }
+.side b { font-family: var(--font-mono); }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+.btn.alt { background: transparent; color: var(--ink); border: 1.5px solid var(--line); }
+.overlay input {
+  width: min(100%, 260px);
+  padding: 10px 12px;
+  font: inherit;
+  text-align: center;
+  background: var(--bg);
+  color: var(--ink);
+  border: 1.5px solid var(--line);
+  border-radius: 8px;
+}
+.overlay .err { color: var(--bad); }
+.overlay .err:empty { display: none; }

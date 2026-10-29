@@ -60,14 +60,18 @@
 
   const $ = (id) => document.getElementById(id);
   const stageEl = $('stage'), pipsEl = $('pips'), countEl = $('count');
+  const modeEl = $('mode'), sideEl = $('side');
   const clockEl = $('clock'), statusEl = $('status'), overlayEl = $('overlay'), padEl = $('pad');
 
+  const SERVER = location.protocol === 'file:' ? 'http://localhost:3000' : '';
+  let online = null; // { code, id, es, round, combo, pos, presses, scores }
   let match, tiles = [];
   let phase = 'idle'; // idle | countdown | playing | locked | result
   let t0 = 0, comboT0 = 0, comboTimes = [];
   let clockOn = false, timer = 0;
   const keys = {}, keyTimers = {};
 
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => '&#' + c.charCodeAt(0) + ';');
   const fmt = (ms) => (ms / 1000).toFixed(1) + ' s';
 
   function readBest() {
@@ -142,16 +146,27 @@
   function showOverlay(html) {
     overlayEl.innerHTML = html;
     overlayEl.hidden = false;
-    overlayEl.querySelector('.btn')?.focus();
+    overlayEl.querySelector('input, .btn')?.focus();
   }
   function hideOverlay() {
     overlayEl.hidden = true;
     document.activeElement?.blur();
   }
   // Un único listener para los botones "Empezar" y "Jugar otra vez"
-  overlayEl.addEventListener('click', (e) => { if (e.target.closest('.btn')) startCountdown(); });
+  const ACTIONS = {
+    solo: () => startCountdown(),
+    menu: () => showIdle(),
+    online: () => showOnlineMenu(),
+    create: () => enterRoom(true),
+    join: () => enterRoom(false),
+    start: () => api(`/rooms/${online.code}/start`).catch(() => {}),
+  };
+  overlayEl.addEventListener('click', (e) => {
+    ACTIONS[e.target.closest('[data-action]')?.dataset.action]?.();
+  });
 
   function showIdle() {
+    leaveOnline();
     phase = 'idle';
     const best = readBest();
     showOverlay(
@@ -159,7 +174,8 @@
       `<p>Aparecen entre ${CONFIG.minLen} y ${CONFIG.maxLen} flechas. Púlsalas en el mismo orden con el teclado. ` +
       `Si fallas, esa combinación vuelve a empezar. Consigue ${CONFIG.target} puntos lo más rápido que puedas.</p>` +
       (best ? `<p class="record">Tu mejor tiempo: ${fmt(best)}</p>` : '') +
-      '<button class="btn" type="button">Empezar</button>'
+      '<div class="actions"><button class="btn" data-action="solo">Entrenamiento</button>' +
+      '<button class="btn" data-action="online">Online</button></div>'
     );
   }
 
@@ -178,7 +194,8 @@
         `<div><dt>Combo más rápido</dt><dd>${fmt(Math.min(...comboTimes))}</dd></div>` +
       '</dl>' +
       '<p class="record">' + (isRecord ? '<strong>Nuevo récord</strong>' : 'Tu mejor tiempo: ' + fmt(best)) + '</p>' +
-      '<button class="btn" type="button">Jugar otra vez</button>'
+      '<div class="actions"><button class="btn" data-action="solo">Jugar otra vez</button>' +
+      '<button class="btn alt" data-action="menu">Menú</button></div>'
     );
   }
 
@@ -194,11 +211,16 @@
     renderCombo(SAMPLE, 0, true);
     setStatus();
 
+    modeEl.textContent = 'Entrenamiento · un jugador';
+    countdown(CONFIG.countdownMs, begin);
+  }
+
+  function countdown(ms, done) {
     let n = 3;
     const step = () => {
-      if (n === 0) return begin();
+      if (n === 0) return done?.();
       showOverlay(`<div class="big" aria-live="assertive">${n--}</div><p>Prepara las flechas</p>`);
-      timer = setTimeout(step, CONFIG.countdownMs);
+      timer = setTimeout(step, ms);
     };
     step();
   }
@@ -219,9 +241,16 @@
     timer = setTimeout(fn, ms);
   }
 
+  function showFail() {
+    tiles.forEach((t) => { t.classList.remove('done', 'current'); t.classList.add('fail'); });
+    setStatus('Fallo. Esa combinación empieza de nuevo', 'bad');
+    lockThen(260, () => { updateTiles(0); setStatus('Repite la combinación'); phase = 'playing'; });
+  }
+
   function handleDir(dir) {
     flashKey(dir);
     if (phase !== 'playing') return;
+    if (online) return onlinePress(dir);
     const ev = match.press(dir);
     const now = performance.now();
 
@@ -230,12 +259,7 @@
       return;
     }
 
-    if (ev.type === 'fail') {
-      tiles.forEach((t) => { t.classList.remove('done', 'current'); t.classList.add('fail'); });
-      setStatus('Fallo. Esa combinación empieza de nuevo', 'bad');
-      lockThen(260, () => { updateTiles(0); setStatus('Repite la combinación'); phase = 'playing'; });
-      return;
-    }
+    if (ev.type === 'fail') return showFail();
 
     // complete | win: se ha terminado una combinación
     comboTimes.push(now - comboT0);
@@ -257,6 +281,138 @@
       setStatus('¡Cinco de cinco!', 'good');
       lockThen(650, () => showResult(total));
     }
+  }
+
+  // ── Online ────────────────────────────────────────────────
+  const api = (path, body = {}) =>
+    fetch(SERVER + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then((r) => r.json().then((d) => (r.ok ? d : Promise.reject(new Error(d.error)))));
+
+  const myScore = () => online.scores.find((s) => s.id === online.id)?.score ?? 0;
+
+  function renderSide() {
+    sideEl.hidden = !online;
+    if (!online) return;
+    const rows = [...online.scores].sort((a, b) => b.score - a.score);
+    sideEl.innerHTML = '<h2>Clasificación</h2><ol>' + rows.map((s) =>
+      `<li class="${s.id === online.id ? 'me' : ''}"><span>${esc(s.name)}</span><b>${s.score}</b></li>`).join('') + '</ol>';
+  }
+
+  function leaveOnline() {
+    online?.es?.close();
+    online = null;
+    clearTimeout(timer);
+    clockOn = false;
+    renderSide();
+  }
+
+  function showOnlineMenu() {
+    showOverlay(
+      '<h2>Online</h2>' +
+      '<input id="name" placeholder="Tu nombre" maxlength="20" autocomplete="off">' +
+      '<input id="code" placeholder="Código de sala" maxlength="6" autocomplete="off">' +
+      '<p class="err" id="err"></p>' +
+      '<div class="actions"><button class="btn" data-action="create">Crear sala</button>' +
+      '<button class="btn" data-action="join">Unirse</button>' +
+      '<button class="btn alt" data-action="menu">Volver</button></div>'
+    );
+  }
+
+  function renderLobby() {
+    showOverlay(
+      `<h2>Sala ${esc(online.code)}</h2>` +
+      `<p>Comparte el código. Jugadores conectados: ${online.scores.length}</p>` +
+      '<button class="btn" data-action="start">Empezar</button>'
+    );
+  }
+
+  async function enterRoom(create) {
+    const name = $('name').value.trim() || 'Jugador';
+    let code = $('code').value.trim().toUpperCase();
+    try {
+      if (create) ({ code } = await api('/rooms'));
+      const { playerId } = await api(`/rooms/${code}/join`, { name });
+      online = { code, id: playerId, round: 0, combo: [], pos: 0, presses: [], scores: [] };
+      modeEl.textContent = 'Online · sala ' + code;
+      phase = 'lobby';
+      connect();
+    } catch (err) {
+      $('err').textContent = err.message;
+    }
+  }
+
+  // Avisa de quién ha puntuado en la ronda anterior y a los 1,5 s vuelve al mensaje normal
+  function announce({ scorers = [], scores }) {
+    if (!scorers.length) return;
+    const mine = scorers.includes(online.id);
+    const who = scorers.map((id) => id === online.id ? 'ti' : scores.find((s) => s.id === id)?.name);
+    const msg = mine && who.length === 1 ? '¡Punto para ti!' : 'Punto para ' + who.join(', ');
+    setStatus(msg, mine ? 'good' : 'bad');
+    setTimeout(() => { if (statusEl.textContent === msg) setStatus('Repite la combinación'); }, 1500);
+  }
+
+  // Canal SSE: el servidor decide, el cliente solo dibuja lo que le llega
+  function connect() {
+    const es = online.es = new EventSource(`${SERVER}/rooms/${online.code}/events?player=${online.id}`);
+    const on = (name, fn) => es.addEventListener(name, (e) => fn(JSON.parse(e.data)));
+
+    on('players', (scores) => {
+      online.scores = scores;
+      renderSide();
+      if (phase === 'lobby') renderLobby();
+    });
+
+    on('start', (d) => {
+      phase = 'countdown';
+      clockEl.textContent = '0.0 s';
+      renderPips(0);
+      renderCombo(SAMPLE, 0, true);
+      setStatus();
+      countdown(d.startsIn / 3);
+    });
+
+    on('round', (d) => {
+      Object.assign(online, { round: d.round, combo: d.combo, scores: d.scores, pos: 0, presses: [] });
+      clearTimeout(timer);
+      hideOverlay();
+      renderSide();
+      renderPips(myScore());
+      renderCombo(d.combo, 0);
+      setStatus('Repite la combinación');
+      announce(d);
+      phase = 'playing';
+      if (!clockOn) { t0 = performance.now(); clockOn = true; tick(); }
+    });
+
+    on('gameOver', (d) => {
+      online.scores = d.scores;
+      renderSide();
+      renderPips(myScore());
+      clearTimeout(timer);
+      clockOn = false;
+      phase = 'result';
+      es.close();
+      const names = d.winners.map((id) => esc(d.scores.find((s) => s.id === id).name)).join(', ');
+      showOverlay(
+        `<h2>${d.winners.includes(online.id) ? '¡Has ganado!' : 'Partida terminada'}</h2>` +
+        `<p>Ganador: ${names}</p>` +
+        '<button class="btn" data-action="menu">Volver al menú</button>'
+      );
+    });
+
+    es.onerror = () => { if (es.readyState === EventSource.CLOSED) setStatus('Conexión perdida', 'bad'); };
+  }
+
+  // Validación local (respuesta instantánea); el servidor confirma la secuencia entera
+  function onlinePress(dir) {
+    const o = online;
+    if (dir !== o.combo[o.pos]) { o.pos = 0; o.presses = []; return showFail(); }
+    o.presses.push(dir);
+    updateTiles(++o.pos);
+    if (o.pos < o.combo.length) return;
+    phase = 'waiting'; // hasta que llegue la siguiente ronda
+    setStatus('¡Completada! Esperando al servidor…', 'good');
+    api(`/rooms/${o.code}/complete`, { player: o.id, round: o.round, presses: o.presses }).catch(() => {});
   }
 
   window.addEventListener('keydown', (e) => {
