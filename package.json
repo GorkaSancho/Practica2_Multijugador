@@ -1,0 +1,22 @@
+{
+  "name": "joc_multijugador",
+  "version": "1.0.0",
+  "private":true,
+  "description": "",
+  "main": "script.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GorkaSancho/Practica2_Multijugador.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/GorkaSancho/Practica2_Multijugador/issues"
+  },
+  "homepage": "https://github.com/GorkaSancho/Practica2_Multijugador#readme"
+}
