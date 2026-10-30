@@ -11,6 +11,7 @@
 
   /** Configuració del mode Entrenament (el mode en línia la porta el servidor). */
   const CONFIG = { target: 5, minLen: 4, maxLen: 12, countdownMs: 700 };
+  const BR_TARGET = 3;
 
   // ───────────────────────────────────────────────────────────
   // LÒGICA DE PARTIDA (sense DOM, sense temps, sense xarxa)
@@ -93,7 +94,7 @@
   const clockEl = $('clock'), statusEl = $('status'), overlayEl = $('overlay'), padEl = $('pad');
 
   /** Dades de la partida en línia, o null si no s'hi està. */
-  let online = null; // { code, id, es, round, combo, pos, presses, scores }
+  let online = null; // { code, id, es, mode, round, combo, pos, presses, scores }
   let match, tiles = [];
   /** Fase del joc: idle | lobby | countdown | playing | waiting | locked | result */
   let phase = 'idle';
@@ -126,10 +127,10 @@
   }
 
   /** Dibuixa la barra de punts i el comptador "n / objectiu". */
-  function renderPips(score) {
+  function renderPips(score, target = CONFIG.target) {
     pipsEl.innerHTML = '<span class="pip on"></span>'.repeat(score) +
-                       '<span class="pip"></span>'.repeat(CONFIG.target - score);
-    countEl.textContent = score + ' / ' + CONFIG.target;
+                       '<span class="pip"></span>'.repeat(target - score);
+    countEl.textContent = score + ' / ' + target;
   }
 
   /**
@@ -403,6 +404,10 @@
       '<h2>En línia</h2>' +
       '<input id="name" placeholder="El teu nom" maxlength="20" autocomplete="off">' +
       '<input id="code" placeholder="Codi de sala" maxlength="6" autocomplete="off">' +
+      '<select id="onlineMode">' +
+        '<option value="classic">Clàssic · 5 punts</option>' +
+        '<option value="battleRoyale">Battle Royale · 3 punts</option>' +
+      '</select>' +
       '<p class="err" id="err"></p>' +
       '<div class="actions"><button class="btn" data-action="create">Crea sala</button>' +
       '<button class="btn" data-action="join">Uneix-te</button>' +
@@ -412,8 +417,13 @@
 
   /** Sala d'espera: mostra el codi per compartir i el botó de començar. */
   function renderLobby() {
+    const mode = online.mode === 'battleRoyale'
+      ? 'Battle Royale · 3 punts'
+      : 'Clàssic · 5 punts';
+
     showOverlay(
       `<h2>Sala ${esc(online.code)}</h2>` +
+      `<p>${mode}</p>` +
       `<p>Comparteix el codi. Jugadors a la sala: ${online.scores.length} / 10</p>` +
       '<button class="btn" data-action="start">Comença</button>'
     );
@@ -436,10 +446,27 @@
   async function enterRoom(create) {
     const name = $('name').value.trim() || 'Jugador';
     let code = $('code').value.trim().toUpperCase();
+    const mode = $('onlineMode').value;
+
     try {
-      if (create) ({ code } = await api('/rooms'));
-      const { playerId } = await api(`/rooms/${code}/join`, { name });
-      online = { code, id: playerId, round: 0, combo: [], pos: 0, presses: [], scores: [] };
+      if (create) {
+        const room = await api('/rooms', { mode });
+        code = room.code;
+      }
+
+      const joined = await api(`/rooms/${code}/join`, { name });
+
+      online = {
+        code,
+        id: joined.playerId,
+        mode: joined.mode,
+        round: 0,
+        combo: [],
+        pos: 0,
+        presses: [],
+        scores: []
+      };
+
       modeEl.textContent = 'En línia · sala ' + code;
       phase = 'lobby';
       connect();
@@ -480,33 +507,90 @@
       clearTimeout(timer);
       phase = 'countdown';
       clockEl.textContent = '0.0 s';
-      renderPips(0);
+      renderPips(0, online.mode === 'battleRoyale' ? BR_TARGET : CONFIG.target);
       renderCombo(SAMPLE, 0, true);
       setStatus();
       countdown(d.startsIn / 3); // tres números repartits en el temps que indica el servidor
     });
 
     on('round', (d) => {
-      Object.assign(online, { round: d.round, combo: d.combo, scores: d.scores, pos: 0, presses: [] });
+      Object.assign(online, {
+        round: d.round,
+        combo: d.combo || [],
+        scores: d.scores,
+        pos: 0,
+        presses: []
+      });
+
       clearTimeout(timer);
       hideOverlay();
       renderSide();
-      renderPips(myScore());
+      renderPips(myScore(), online.mode === 'battleRoyale' ? BR_TARGET : CONFIG.target);
+
+      if (online.mode === 'battleRoyale') {
+        if (d.finished) {
+          phase = 'waiting';
+          setStatus('Has arribat als 3 punts. Espera els altres jugadors…', 'good');
+        } else {
+          phase = 'waiting';
+          setStatus('Esperant la teva combinació…');
+        }
+      } else {
+        renderCombo(d.combo, 0);
+        setStatus('Repeteix la combinació');
+        announce(d);
+        phase = 'playing';
+      }
+
+      if (!clockOn) { t0 = performance.now(); clockOn = true; tick(); }
+    });
+
+    on('combo', (d) => {
+      if (online.mode !== 'battleRoyale') return;
+
+      Object.assign(online, {
+        round: d.round,
+        combo: d.combo,
+        pos: 0,
+        presses: []
+      });
+
+      renderPips(d.score, BR_TARGET);
       renderCombo(d.combo, 0);
       setStatus('Repeteix la combinació');
-      announce(d);
       phase = 'playing';
+
       if (!clockOn) { t0 = performance.now(); clockOn = true; tick(); }
+    });
+
+    on('eliminated', (d) => {
+      online.scores = d.scores;
+      renderSide();
+
+      if (d.eliminated === online.id) {
+        clockOn = false;
+        phase = 'result';
+        es.close();
+
+        showOverlay(
+          '<h2>Has quedat eliminat</h2>' +
+          '<p>Has estat l’últim jugador d’aquesta fase.</p>' +
+          '<button class="btn" data-action="menu">Torna al menú</button>'
+        );
+      } else {
+        setStatus('Un jugador ha quedat eliminat', 'bad');
+      }
     });
 
     on('gameOver', (d) => {
       online.scores = d.scores;
       renderSide();
-      renderPips(myScore());
+      renderPips(myScore(), online.mode === 'battleRoyale' ? BR_TARGET : CONFIG.target);
       clearTimeout(timer);
       clockOn = false;
       phase = 'result';
       es.close();
+
       const names = d.winners.map((id) => esc(d.scores.find((s) => s.id === id).name)).join(', ');
       showOverlay(
         `<h2>${d.winners.includes(online.id) ? 'Has guanyat!' : 'Partida acabada'}</h2>` +
@@ -535,13 +619,49 @@
   function onlinePress(dir) {
     const o = online;
     if (dir !== o.combo[o.pos]) { o.pos = 0; o.presses = []; return showFail(); }
+
     o.presses.push(dir);
     updateTiles(++o.pos);
+
     if (o.pos < o.combo.length) return;
-    phase = 'waiting'; // fins que arribi la ronda següent
-    setStatus('Completada! Esperant el servidor…', 'good');
-    // El servidor respon 409 si la ronda ja ha canviat; la ronda nova arribarà per SSE.
-    api(`/rooms/${o.code}/complete`, { player: o.id, round: o.round, presses: o.presses }).catch((err) => {
+
+    const round = o.round;
+    phase = 'waiting';
+
+    setStatus(
+      o.mode === 'battleRoyale'
+        ? 'Combinació completada!'
+        : 'Completada! Esperant el servidor…',
+      'good'
+    );
+
+    api(`/rooms/${o.code}/complete`, {
+      player: o.id,
+      round: o.round,
+      presses: o.presses
+    }).then((d) => {
+      if (online !== o) return;
+
+      if (o.mode === 'battleRoyale') {
+        if (d.finished) {
+          // Si la fase ja ha avançat, no canviem l'estat nou rebut per SSE.
+          if (o.round === round) {
+            renderPips(BR_TARGET, BR_TARGET);
+            setStatus('Has arribat als 3 punts. Espera els altres jugadors…', 'good');
+            phase = 'waiting';
+          }
+        } else {
+          o.pos = 0;
+          o.presses = [];
+          o.combo = d.combo;
+
+          renderPips(d.score, BR_TARGET);
+          renderCombo(d.combo, 0);
+          setStatus('Repeteix la combinació');
+          phase = 'playing';
+        }
+      }
+    }).catch((err) => {
       if (online !== o || (err.status === 409 && err.message === 'tard')) return;
       console.error('No s’ha pogut enviar la jugada:', err);
       o.pos = 0;

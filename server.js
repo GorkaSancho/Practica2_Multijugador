@@ -8,13 +8,13 @@
  * També serveix els arxius del joc (index.html, styles.css, script.js).
  *
  * Protocol:
- *   POST /rooms                          crea una sala             → { code }
- *   POST /rooms/:code/join    { name }                             → { playerId }
+ *   POST /rooms                          crea una sala             → { code, mode }
+ *   POST /rooms/:code/join    { name }                             → { playerId, mode }
  *   GET  /rooms/:code/events?player=ID   canal SSE (servidor → jugador)
  *   POST /rooms/:code/start              comença la partida
  *   POST /rooms/:code/complete  { player, round, presses }         combinació acabada
  *
- * Esdeveniments SSE: players | start | round | gameOver
+ * Esdeveniments SSE: players | start | round | combo | eliminated | gameOver
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -22,6 +22,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const TARGET = 5;      // punts per guanyar
+const BR_TARGET = 3;   // punts per superar una fase del Battle Royale
 const MIN_LEN = 4;     // mida mínima d'una combinació
 const MAX_LEN = 12;    // mida màxima
 const GRACE_MS = 120;  // finestra de gràcia: qui arriba dins d'aquest temps també puntua
@@ -67,6 +68,102 @@ function startRound(room, scorers = []) {
   broadcast(room, 'round', { round: room.round, combo: room.combo, scores: scoreboard(room), scorers });
 }
 
+/**
+ * Comença una fase del Battle Royale.
+ * Cada jugador rep una combinació pròpia.
+ */
+function startBattleRoyalePhase(room) {
+  room.round++;
+  room.brFinished = new Set();
+  room.brLastFinisher = null;
+
+  for (const player of room.players.values()) {
+    player.score = 0;
+    player.combo = newCombo();
+  }
+
+  broadcast(room, 'round', {
+    round: room.round,
+    scores: scoreboard(room),
+    scorers: []
+  });
+
+  for (const player of room.players.values()) {
+    if (player.res) {
+      send(player.res, 'combo', {
+        round: room.round,
+        combo: player.combo,
+        score: player.score
+      });
+    }
+  }
+}
+
+/**
+ * Gestiona que un jugador hagi arribat als BR_TARGET punts.
+ * Els jugadors que arriben esperen mentre els altres continuen jugant.
+ */
+function completeBattleRoyalePhase(room, playerId) {
+  room.brFinished.add(playerId);
+  room.brLastFinisher = playerId;
+
+  const remaining = [...room.players.values()]
+    .filter((player) => !room.brFinished.has(player.id));
+
+  if (remaining.length > 1) return;
+
+  // Si queda un jugador sense acabar, aquest és l'últim i queda eliminat.
+  // Si tots han acabat, s'elimina l'últim que ha arribat.
+  const eliminated = remaining.length === 1
+    ? remaining[0]
+    : room.players.get(room.brLastFinisher);
+
+  if (!eliminated) return;
+
+  const eliminatedRes = eliminated.res;
+  room.players.delete(eliminated.id);
+
+  const scores = scoreboard(room);
+
+  // Només queda un jugador: tenim guanyador.
+  if (room.players.size === 1) {
+    room.state = 'over';
+
+    if (eliminatedRes) {
+      send(eliminatedRes, 'eliminated', {
+        eliminated: eliminated.id,
+        scores
+      });
+      eliminatedRes.end();
+    }
+
+    const winner = [...room.players.values()][0];
+
+    broadcast(room, 'gameOver', {
+      scores,
+      winners: [winner.id]
+    });
+
+    return;
+  }
+
+  // Avisem tant els supervivents com el jugador eliminat.
+  if (eliminatedRes) {
+    send(eliminatedRes, 'eliminated', {
+      eliminated: eliminated.id,
+      scores
+    });
+    eliminatedRes.end();
+  }
+
+  broadcast(room, 'eliminated', {
+    eliminated: eliminated.id,
+    scores
+  });
+
+  startBattleRoyalePhase(room);
+}
+
 /** Acaba la finestra de gràcia: puntua els qui han arribat i decideix si hi ha guanyador. */
 function closeRound(room, round) {
   if (rooms.get(room.code) !== room || room.state !== 'playing' || room.round !== round || !room.winners)
@@ -96,6 +193,7 @@ function pruneRooms(now = Date.now()) {
       if (!player.res && player.disconnectedAt && now - player.disconnectedAt >= ROOM_TTL_MS) {
         room.players.delete(id);
         room.winners?.delete(id);
+        room.brFinished?.delete(id);
         room.lastScorers = room.lastScorers.filter((scorer) => scorer !== id);
         playersChanged = true;
       }
@@ -108,14 +206,37 @@ function pruneRooms(now = Date.now()) {
 }
 
 /** Estat actual d'una sala, enviat en obrir o reprendre un canal SSE. */
-function sendRoomState(res, room) {
+function sendRoomState(res, room, playerId) {
   send(res, 'players', scoreboard(room));
   if (room.state === 'lobby') return;
+
   if (room.state === 'playing' && room.round === 0) {
     send(res, 'start', { startsIn: Math.max(0, room.startAt - Date.now()) });
     return;
   }
+
   if (room.state === 'playing') {
+    if (room.mode === 'battleRoyale') {
+      const player = room.players.get(playerId);
+
+      send(res, 'round', {
+        round: room.round,
+        scores: scoreboard(room),
+        scorers: [],
+        finished: room.brFinished.has(playerId)
+      });
+
+      if (player && !room.brFinished.has(playerId)) {
+        send(res, 'combo', {
+          round: room.round,
+          combo: player.combo,
+          score: player.score
+        });
+      }
+
+      return;
+    }
+
     send(res, 'round', {
       round: room.round,
       combo: room.combo,
@@ -124,6 +245,7 @@ function sendRoomState(res, room) {
     });
     return;
   }
+
   const scores = scoreboard(room);
   const top = Math.max(...scores.map((player) => player.score));
   send(res, 'gameOver', { scores, winners: scores.filter((player) => player.score === top).map((player) => player.id) });
@@ -172,20 +294,31 @@ const server = http.createServer(async (req, res) => {
   if (!code && req.method === 'POST') {
     pruneRooms();
     if (rooms.size >= MAX_ROOMS) return json(res, 503, { error: 'servidor ple, torna-ho a provar més tard' });
+
+    const { mode } = await readBody(req);
+
     let newCode;
     do { newCode = Math.random().toString(36).slice(2, 8).toUpperCase(); } while (rooms.has(newCode));
+
     rooms.set(newCode, {
       code: newCode,
+      mode: mode === 'battleRoyale' ? 'battleRoyale' : 'classic',
       state: 'lobby',
       players: new Map(),
       round: 0,
       combo: [],
       winners: null,
       lastScorers: [],
+      brFinished: new Set(),
+      brLastFinisher: null,
       startAt: 0,
       lastActivity: Date.now(),
     });
-    return json(res, 201, { code: newCode });
+
+    return json(res, 201, {
+      code: newCode,
+      mode: rooms.get(newCode).mode
+    });
   }
 
   const room = rooms.get(code);
@@ -204,12 +337,16 @@ const server = http.createServer(async (req, res) => {
       id,
       name: String(name || 'Jugador').slice(0, 20),
       score: 0,
+      combo: [],
       res: null,
       disconnectedAt: Date.now(),
     });
     room.lastActivity = Date.now();
     broadcast(room, 'players', scoreboard(room));
-    return json(res, 200, { playerId: id });
+    return json(res, 200, {
+      playerId: id,
+      mode: room.mode
+    });
   }
 
   // Sortir de la sala i alliberar la plaça del jugador.
@@ -219,6 +356,7 @@ const server = http.createServer(async (req, res) => {
     if (!player) return json(res, 404, { error: 'jugador desconegut' });
     room.players.delete(id);
     room.winners?.delete(id);
+    room.brFinished?.delete(id);
     room.lastScorers = room.lastScorers.filter((scorer) => scorer !== id);
     if (player.res) {
       const resToClose = player.res;
@@ -236,7 +374,8 @@ const server = http.createServer(async (req, res) => {
 
   // Canal SSE: la resposta es deixa oberta i es guarda al jugador per escriure-hi més tard
   if (action === 'events' && req.method === 'GET') {
-    const p = room.players.get(url.searchParams.get('player'));
+    const playerId = url.searchParams.get('player');
+    const p = room.players.get(playerId);
     if (!p) return json(res, 404, { error: 'jugador desconegut' });
     p.res?.end(); // només es manté un canal obert per jugador
     res.writeHead(200, {
@@ -249,7 +388,7 @@ const server = http.createServer(async (req, res) => {
     p.disconnectedAt = null;
     room.lastActivity = Date.now();
     res.flushHeaders();
-    sendRoomState(res, room);
+    sendRoomState(res, room, playerId);
     res.on('close', () => {
       if (p.res === res) {
         p.res = null;
@@ -263,13 +402,19 @@ const server = http.createServer(async (req, res) => {
   // Començar la partida
   if (action === 'start' && req.method === 'POST') {
     if (room.state !== 'lobby') return json(res, 409, { error: 'ja començada' });
+
     room.state = 'playing';
     room.lastActivity = Date.now();
     room.startAt = Date.now() + START_MS;
     broadcast(room, 'start', { startsIn: START_MS });
+
     setTimeout(() => {
-      if (rooms.get(code) === room && room.state === 'playing') startRound(room);
+      if (rooms.get(code) === room && room.state === 'playing') {
+        if (room.mode === 'battleRoyale') startBattleRoyalePhase(room);
+        else startRound(room);
+      }
     }, START_MS);
+
     return json(res, 200, { ok: true });
   }
 
@@ -279,6 +424,36 @@ const server = http.createServer(async (req, res) => {
     // Sense cap await a partir d'aquí: Node executa el bloc sencer sense interrupcions
     if (!room.players.has(player)) return json(res, 404, { error: 'jugador desconegut' });
     if (room.state !== 'playing' || round !== room.round) return json(res, 409, { error: 'tard' });
+
+    const currentPlayer = room.players.get(player);
+
+    // Battle Royale: cada jugador té la seva pròpia combinació
+    if (room.mode === 'battleRoyale') {
+      if (room.brFinished.has(player))
+        return json(res, 409, { error: 'ja acabat' });
+
+      if (!Array.isArray(presses) || presses.join() !== currentPlayer.combo.join())
+        return json(res, 400, { error: 'seqüència incorrecta' });
+
+      room.lastActivity = Date.now();
+      currentPlayer.score++;
+
+      if (currentPlayer.score >= BR_TARGET) {
+        completeBattleRoyalePhase(room, player);
+        return json(res, 200, { ok: true, finished: true, score: BR_TARGET });
+      }
+
+      currentPlayer.combo = newCombo();
+
+      return json(res, 200, {
+        ok: true,
+        finished: false,
+        score: currentPlayer.score,
+        combo: currentPlayer.combo
+      });
+    }
+
+    // Mode clàssic
     if (!Array.isArray(presses) || presses.join() !== room.combo.join())
       return json(res, 400, { error: 'seqüència incorrecta' });
     room.lastActivity = Date.now();
