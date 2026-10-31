@@ -70,16 +70,17 @@ function startRound(room, scorers = []) {
 
 /**
  * Comença una fase del Battle Royale.
- * Cada jugador rep una combinació pròpia.
+ * Cada jugador rep les mateixes tres combinacions.
  */
 function startBattleRoyalePhase(room) {
   room.round++;
   room.brFinished = new Set();
   room.brLastFinisher = null;
+  room.brCombos = Array.from({ length: BR_TARGET }, newCombo);
 
   for (const player of room.players.values()) {
     player.score = 0;
-    player.combo = newCombo();
+    player.combo = room.brCombos[0];
   }
 
   broadcast(room, 'round', {
@@ -107,16 +108,10 @@ function completeBattleRoyalePhase(room, playerId) {
   room.brFinished.add(playerId);
   room.brLastFinisher = playerId;
 
-  const remaining = [...room.players.values()]
-    .filter((player) => !room.brFinished.has(player.id));
+  if (room.brFinished.size < room.players.size) return;
 
-  if (remaining.length > 1) return;
-
-  // Si queda un jugador sense acabar, aquest és l'últim i queda eliminat.
   // Si tots han acabat, s'elimina l'últim que ha arribat.
-  const eliminated = remaining.length === 1
-    ? remaining[0]
-    : room.players.get(room.brLastFinisher);
+  const eliminated = room.players.get(room.brLastFinisher);
 
   if (!eliminated) return;
 
@@ -311,6 +306,7 @@ const server = http.createServer(async (req, res) => {
       lastScorers: [],
       brFinished: new Set(),
       brLastFinisher: null,
+      brCombos: [],
       startAt: 0,
       lastActivity: Date.now(),
     });
@@ -427,7 +423,7 @@ const server = http.createServer(async (req, res) => {
 
     const currentPlayer = room.players.get(player);
 
-    // Battle Royale: cada jugador té la seva pròpia combinació
+    // Battle Royale: tots els jugadors comparteixen les tres combinacions
     if (room.mode === 'battleRoyale') {
       if (room.brFinished.has(player))
         return json(res, 409, { error: 'ja acabat' });
@@ -443,7 +439,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, finished: true, score: BR_TARGET });
       }
 
-      currentPlayer.combo = newCombo();
+      currentPlayer.combo = room.brCombos[currentPlayer.score];
 
       return json(res, 200, {
         ok: true,
