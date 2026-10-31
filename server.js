@@ -10,9 +10,11 @@
  * Protocol:
  *   POST /rooms                          crea una sala             → { code, mode }
  *   POST /rooms/:code/join    { name }                             → { playerId, mode }
+ *   GET  /rooms/:code/time?player=ID     hora del servidor per sincronitzar
+ *   POST /rooms/:code/sync { player, offset, rtt } calibratge del rellotge
  *   GET  /rooms/:code/events?player=ID   canal SSE (servidor → jugador)
  *   POST /rooms/:code/start              comença la partida
- *   POST /rooms/:code/complete  { player, round, presses }         combinació acabada
+ *   POST /rooms/:code/complete  { player, round, presses, finishedAt }
  *
  * Esdeveniments SSE: players | start | round | combo | eliminated | gameOver
  */
@@ -27,6 +29,9 @@ const MIN_LEN = 4;     // mida mínima d'una combinació
 const MAX_LEN = 12;    // mida màxima
 const GRACE_MS = 120;  // finestra de gràcia: qui arriba dins d'aquest temps també puntua
 const START_MS = 3000; // compte enrere abans de la primera ronda
+const MAX_COMPENSATION_MS = 120;
+const BR_PHASE_TIMEOUT_MS = 30000;
+const START_BUFFER_MS = 250;
 const DIRS = ['up', 'down', 'left', 'right'];
 const MAX_PLAYERS = 10; // màxim de jugadors per sala
 const MAX_ROOMS = 100;  // màxim de sales simultànies per procés
@@ -57,88 +62,142 @@ function broadcast(room, event, data) {
   for (const p of room.players.values()) if (p.res) send(p.res, event, data);
 }
 
+/** Converteix una marca local a hora de servidor i limita la compensació al retard mesurat. */
+function adjustedFinishAt(player, finishedAt, receivedAt) {
+  const estimatedAt = finishedAt + player.clockOffset;
+  const compensation = Math.min(MAX_COMPENSATION_MS, player.rtt / 2);
+  return Math.min(receivedAt, Math.max(receivedAt - compensation, estimatedAt));
+}
+
 // ── Rondes ───────────────────────────────────────────────────
 
 /** Comença una ronda: combinació nova per a tothom. scorers = qui ha puntuat a l'anterior. */
-function startRound(room, scorers = []) {
+function startRound(room, scorers = [], startAt = room.startAt) {
   room.round++;
   room.combo = newCombo();
   room.winners = null; // ningú ha acabat encara aquesta ronda
   room.lastScorers = scorers;
-  broadcast(room, 'round', { round: room.round, combo: room.combo, scores: scoreboard(room), scorers });
+  room.startAt = startAt;
+  broadcast(room, 'round', {
+    round: room.round,
+    combo: room.combo,
+    scores: scoreboard(room),
+    scorers,
+    startAt: room.startAt
+  });
 }
 
 /**
  * Comença una fase del Battle Royale.
- * Cada jugador rep una combinació pròpia.
+ * Tothom rep les mateixes tres combinacions i les completa en ordre.
  */
-function startBattleRoyalePhase(room) {
+function startBattleRoyalePhase(room, startAt = Date.now() + Math.max(750, room.maxRtt + START_BUFFER_MS)) {
+  clearTimeout(room.brPhaseTimer);
   room.round++;
   room.brFinished = new Set();
-  room.brLastFinisher = null;
+  room.brFinishTimes = new Map();
+  room.brCombos = Array.from({ length: BR_TARGET }, newCombo);
+  room.startAt = startAt;
 
   for (const player of room.players.values()) {
     player.score = 0;
-    player.combo = newCombo();
   }
 
   broadcast(room, 'round', {
     round: room.round,
     scores: scoreboard(room),
-    scorers: []
+    scorers: [],
+    combos: room.brCombos,
+    startAt: room.startAt
   });
 
   for (const player of room.players.values()) {
-    if (player.res) {
+    if (player.res && !room.brFinished.has(player.id)) {
       send(player.res, 'combo', {
         round: room.round,
-        combo: player.combo,
+        combo: room.brCombos[player.score],
         score: player.score
       });
     }
   }
+
+  const round = room.round;
+  const phaseStartDelay = Math.max(0, room.startAt - Date.now());
+  room.brPhaseTimer = setTimeout(
+    () => timeoutBattleRoyalePhase(room, round),
+    phaseStartDelay + BR_PHASE_TIMEOUT_MS
+  );
 }
 
 /**
- * Gestiona que un jugador hagi arribat als BR_TARGET punts.
- * Els jugadors que arriben esperen mentre els altres continuen jugant.
+ * Resol una fase quan tots els jugadors que continuen a la sala han acabat.
  */
-function completeBattleRoyalePhase(room, playerId) {
-  room.brFinished.add(playerId);
-  room.brLastFinisher = playerId;
+function resolveBattleRoyalePhase(room) {
+  if (room.state !== 'playing' || room.mode !== 'battleRoyale') return;
+  if (!room.players.size) {
+    clearTimeout(room.brPhaseTimer);
+    room.brPhaseTimer = null;
+    rooms.delete(room.code);
+    return;
+  }
+  if (room.players.size === 1) {
+    clearTimeout(room.brPhaseTimer);
+    room.brPhaseTimer = null;
+    room.state = 'over';
+    const winner = [...room.players.values()][0];
+    broadcast(room, 'gameOver', {
+      scores: scoreboard(room),
+      winners: [winner.id]
+    });
+    return;
+  }
 
-  const remaining = [...room.players.values()]
+  const unfinished = [...room.players.values()]
     .filter((player) => !room.brFinished.has(player.id));
+  if (unfinished.length) return;
 
-  if (remaining.length > 1) return;
-
-  // Si queda un jugador sense acabar, aquest és l'últim i queda eliminat.
-  // Si tots han acabat, s'elimina l'últim que ha arribat.
-  const eliminated = remaining.length === 1
-    ? remaining[0]
-    : room.players.get(room.brLastFinisher);
-
+  const eliminated = room.players.get([...room.brFinishTimes.entries()]
+    .sort((a, b) => b[1].finishedAt - a[1].finishedAt || b[1].receivedAt - a[1].receivedAt)[0]?.[0]);
   if (!eliminated) return;
 
-  const eliminatedRes = eliminated.res;
-  room.players.delete(eliminated.id);
+  eliminateBattleRoyalePlayers(room, [eliminated.id]);
+}
+
+function timeoutBattleRoyalePhase(room, round) {
+  if (rooms.get(room.code) !== room || room.state !== 'playing' || room.round !== round) return;
+  const unfinished = [...room.players.values()]
+    .filter((player) => !room.brFinished.has(player.id))
+    .map((player) => player.id);
+  if (unfinished.length) eliminateBattleRoyalePlayers(room, unfinished);
+}
+
+function eliminateBattleRoyalePlayers(room, playerIds) {
+  clearTimeout(room.brPhaseTimer);
+  room.brPhaseTimer = null;
+  const eliminated = playerIds
+    .map((id) => room.players.get(id))
+    .filter(Boolean);
+  if (!eliminated.length) return;
+
+  const eliminatedIds = eliminated.map((player) => player.id);
+  for (const player of eliminated) room.players.delete(player.id);
 
   const scores = scoreboard(room);
+
+  for (const player of eliminated) {
+    if (player.res) {
+      send(player.res, 'eliminated', {
+        eliminated: eliminatedIds,
+        scores
+      });
+      player.res.end();
+    }
+  }
 
   // Només queda un jugador: tenim guanyador.
   if (room.players.size === 1) {
     room.state = 'over';
-
-    if (eliminatedRes) {
-      send(eliminatedRes, 'eliminated', {
-        eliminated: eliminated.id,
-        scores
-      });
-      eliminatedRes.end();
-    }
-
     const winner = [...room.players.values()][0];
-
     broadcast(room, 'gameOver', {
       scores,
       winners: [winner.id]
@@ -147,29 +206,34 @@ function completeBattleRoyalePhase(room, playerId) {
     return;
   }
 
-  // Avisem tant els supervivents com el jugador eliminat.
-  if (eliminatedRes) {
-    send(eliminatedRes, 'eliminated', {
-      eliminated: eliminated.id,
-      scores
-    });
-    eliminatedRes.end();
+  if (!room.players.size) {
+    room.state = 'over';
+    return;
   }
 
   broadcast(room, 'eliminated', {
-    eliminated: eliminated.id,
+    eliminated: eliminatedIds,
     scores
   });
 
   startBattleRoyalePhase(room);
 }
 
-/** Acaba la finestra de gràcia: puntua els qui han arribat i decideix si hi ha guanyador. */
+function completeBattleRoyalePhase(room, playerId, finishedAt, receivedAt) {
+  room.brFinished.add(playerId);
+  room.brFinishTimes.set(playerId, { finishedAt, receivedAt });
+  resolveBattleRoyalePhase(room);
+}
+
+/** Acaba la finestra ajustada: puntua els qui han acabat dins de GRACE_MS. */
 function closeRound(room, round) {
   if (rooms.get(room.code) !== room || room.state !== 'playing' || room.round !== round || !room.winners)
     return; // sala esborrada, partida acabada o temporitzador d'una ronda antiga
 
-  const scorers = [...room.winners];
+  const earliestFinish = Math.min(...[...room.winners.values()].map((finish) => finish.adjustedAt));
+  const scorers = [...room.winners.entries()]
+    .filter(([, finish]) => finish.adjustedAt <= earliestFinish + GRACE_MS)
+    .map(([id]) => id);
   for (const id of scorers) {
     const player = room.players.get(id);
     if (player) player.score++;
@@ -181,6 +245,7 @@ function closeRound(room, round) {
     room.state = 'over';
     broadcast(room, 'gameOver', { scores, winners: scores.filter((s) => s.score === top).map((s) => s.id) });
   } else {
+    room.startAt = Date.now() + Math.max(750, room.maxRtt + START_BUFFER_MS);
     startRound(room, scorers);
   }
 }
@@ -194,11 +259,15 @@ function pruneRooms(now = Date.now()) {
         room.players.delete(id);
         room.winners?.delete(id);
         room.brFinished?.delete(id);
+        room.brFinishTimes?.delete(id);
+        room.brFinishTimes?.delete(id);
+        room.brFinishTimes?.delete(id);
         room.lastScorers = room.lastScorers.filter((scorer) => scorer !== id);
         playersChanged = true;
       }
     }
     if (playersChanged && room.players.size) broadcast(room, 'players', scoreboard(room));
+    if (playersChanged) resolveBattleRoyalePhase(room);
 
     const connected = [...room.players.values()].some((player) => player.res && !player.res.destroyed);
     if (!connected && now - room.lastActivity >= ROOM_TTL_MS) rooms.delete(code);
@@ -211,7 +280,7 @@ function sendRoomState(res, room, playerId) {
   if (room.state === 'lobby') return;
 
   if (room.state === 'playing' && room.round === 0) {
-    send(res, 'start', { startsIn: Math.max(0, room.startAt - Date.now()) });
+    send(res, 'start', { startAt: room.startAt });
     return;
   }
 
@@ -223,13 +292,15 @@ function sendRoomState(res, room, playerId) {
         round: room.round,
         scores: scoreboard(room),
         scorers: [],
-        finished: room.brFinished.has(playerId)
+        finished: room.brFinished.has(playerId),
+        combos: room.brCombos,
+        startAt: room.startAt
       });
 
       if (player && !room.brFinished.has(playerId)) {
         send(res, 'combo', {
           round: room.round,
-          combo: player.combo,
+          combo: room.brCombos[player.score],
           score: player.score
         });
       }
@@ -242,6 +313,7 @@ function sendRoomState(res, room, playerId) {
       combo: room.combo,
       scores: scoreboard(room),
       scorers: room.lastScorers.filter((id) => room.players.has(id)),
+      startAt: room.startAt
     });
     return;
   }
@@ -310,7 +382,10 @@ const server = http.createServer(async (req, res) => {
       winners: null,
       lastScorers: [],
       brFinished: new Set(),
-      brLastFinisher: null,
+      brFinishTimes: new Map(),
+      brCombos: [],
+      brPhaseTimer: null,
+      maxRtt: 0,
       startAt: 0,
       lastActivity: Date.now(),
     });
@@ -323,6 +398,26 @@ const server = http.createServer(async (req, res) => {
 
   const room = rooms.get(code);
   if (!room) return json(res, 404, { error: 'sala no trobada' });
+
+  if (action === 'time' && req.method === 'GET') {
+    const playerId = url.searchParams.get('player');
+    if (!room.players.has(playerId)) return json(res, 404, { error: 'jugador desconegut' });
+    return json(res, 200, { serverTime: Date.now() });
+  }
+
+  if (action === 'sync' && req.method === 'POST') {
+    if (room.state !== 'lobby') return json(res, 409, { error: 'la partida ja ha començat' });
+    const { player: playerId, offset, rtt } = await readBody(req);
+    const player = room.players.get(playerId);
+    if (!player) return json(res, 404, { error: 'jugador desconegut' });
+    if (!Number.isFinite(offset) || !Number.isFinite(rtt) || rtt < 0 || rtt > 2000)
+      return json(res, 400, { error: 'mesura de sincronització no vàlida' });
+
+    player.clockOffset = offset;
+    player.rtt = rtt;
+    room.maxRtt = Math.max(...[...room.players.values()].map((p) => p.rtt));
+    return json(res, 200, { ok: true });
+  }
 
   // Entrar a la sala
   if (action === 'join' && req.method === 'POST') {
@@ -337,7 +432,8 @@ const server = http.createServer(async (req, res) => {
       id,
       name: String(name || 'Jugador').slice(0, 20),
       score: 0,
-      combo: [],
+      clockOffset: null,
+      rtt: 0,
       res: null,
       disconnectedAt: Date.now(),
     });
@@ -369,6 +465,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
     broadcast(room, 'players', scoreboard(room));
+    resolveBattleRoyalePhase(room);
     return json(res, 200, { ok: true });
   }
 
@@ -402,68 +499,80 @@ const server = http.createServer(async (req, res) => {
   // Començar la partida
   if (action === 'start' && req.method === 'POST') {
     if (room.state !== 'lobby') return json(res, 409, { error: 'ja començada' });
+    if (room.mode === 'battleRoyale' && room.players.size < 2)
+      return json(res, 409, { error: 'calen almenys dos jugadors per al Battle Royale' });
+    if ([...room.players.values()].some((player) => player.clockOffset === null))
+      return json(res, 409, { error: 'espera que tots els jugadors acabin la sincronització' });
 
     room.state = 'playing';
     room.lastActivity = Date.now();
-    room.startAt = Date.now() + START_MS;
-    broadcast(room, 'start', { startsIn: START_MS });
-
-    setTimeout(() => {
-      if (rooms.get(code) === room && room.state === 'playing') {
-        if (room.mode === 'battleRoyale') startBattleRoyalePhase(room);
-        else startRound(room);
-      }
-    }, START_MS);
+    room.startAt = Date.now() + Math.max(START_MS, room.maxRtt + START_BUFFER_MS);
+    broadcast(room, 'start', { startAt: room.startAt });
+    if (room.mode === 'battleRoyale') startBattleRoyalePhase(room, room.startAt);
+    else startRound(room, [], room.startAt);
 
     return json(res, 200, { ok: true });
   }
 
   // Un jugador diu que ha completat la combinació
   if (action === 'complete' && req.method === 'POST') {
-    const { player, round, presses } = await readBody(req);
+    const { player, round, presses, finishedAt } = await readBody(req);
     // Sense cap await a partir d'aquí: Node executa el bloc sencer sense interrupcions
     if (!room.players.has(player)) return json(res, 404, { error: 'jugador desconegut' });
     if (room.state !== 'playing' || round !== room.round) return json(res, 409, { error: 'tard' });
+    if (Date.now() < room.startAt) return json(res, 409, { error: 'la ronda encara no ha començat' });
 
     const currentPlayer = room.players.get(player);
 
-    // Battle Royale: cada jugador té la seva pròpia combinació
+    // Battle Royale: tothom completa les mateixes tres combinacions en ordre.
     if (room.mode === 'battleRoyale') {
       if (room.brFinished.has(player))
         return json(res, 409, { error: 'ja acabat' });
 
-      if (!Array.isArray(presses) || presses.join() !== currentPlayer.combo.join())
+      if (!Array.isArray(presses) || presses.join() !== room.brCombos[currentPlayer.score]?.join())
         return json(res, 400, { error: 'seqüència incorrecta' });
+
+      const receivedAt = Date.now();
+      let adjustedAt;
+      if (currentPlayer.score + 1 >= BR_TARGET) {
+        if (!Number.isFinite(finishedAt))
+          return json(res, 400, { error: 'marca temporal no vàlida' });
+
+        adjustedAt = adjustedFinishAt(currentPlayer, finishedAt, receivedAt);
+      }
 
       room.lastActivity = Date.now();
       currentPlayer.score++;
 
       if (currentPlayer.score >= BR_TARGET) {
-        completeBattleRoyalePhase(room, player);
+        completeBattleRoyalePhase(room, player, adjustedAt, receivedAt);
         return json(res, 200, { ok: true, finished: true, score: BR_TARGET });
       }
-
-      currentPlayer.combo = newCombo();
 
       return json(res, 200, {
         ok: true,
         finished: false,
         score: currentPlayer.score,
-        combo: currentPlayer.combo
+        combo: room.brCombos[currentPlayer.score]
       });
     }
 
     // Mode clàssic
     if (!Array.isArray(presses) || presses.join() !== room.combo.join())
       return json(res, 400, { error: 'seqüència incorrecta' });
-    room.lastActivity = Date.now();
+    if (!Number.isFinite(finishedAt))
+      return json(res, 400, { error: 'marca temporal no vàlida' });
+
+    const receivedAt = Date.now();
+    const adjustedAt = adjustedFinishAt(currentPlayer, finishedAt, receivedAt);
+    room.lastActivity = receivedAt;
 
     if (!room.winners) { // el primer que arriba obre la finestra de gràcia
-      room.winners = new Set();
+      room.winners = new Map();
       const r = room.round;
-      setTimeout(() => closeRound(room, r), GRACE_MS);
+      setTimeout(() => closeRound(room, r), GRACE_MS + MAX_COMPENSATION_MS);
     }
-    room.winners.add(player);
+    if (!room.winners.has(player)) room.winners.set(player, { adjustedAt, receivedAt });
     return json(res, 200, { ok: true });
   }
 

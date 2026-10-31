@@ -370,6 +370,75 @@
         throw error;
       }));
 
+  /** Estima l'offset del rellotge local respecte del servidor amb la mostra de menor RTT. */
+  async function synchronizeClock(code, id) {
+    let best = null;
+    for (let i = 0; i < 5; i++) {
+      const before = performance.now();
+      const response = await fetch(
+        `${SERVER}/rooms/${code}/time?player=${encodeURIComponent(id)}`,
+        { cache: 'no-store' }
+      );
+      const data = await response.json();
+      const after = performance.now();
+      if (!response.ok) throw new Error(data.error || 'No s’ha pogut sincronitzar el rellotge');
+
+      const sample = {
+        offset: data.serverTime - (before + after) / 2,
+        rtt: after - before
+      };
+      if (!best || sample.rtt < best.rtt) best = sample;
+    }
+
+    await api(`/rooms/${code}/sync`, { player: id, ...best });
+    return best;
+  }
+
+  /** Hora estimada del servidor expressada en mil·lisegons. */
+  const serverNow = () => performance.now() + online.clockOffset;
+
+  /** Programa l'inici local a la mateixa hora del servidor per a tots els clients. */
+  function scheduleOnlineStart(startAt, showCountdown = false) {
+    clearTimeout(timer);
+    const localStartAt = startAt - online.clockOffset;
+    let shownNumber = 0;
+    let preparingShown = false;
+
+    const update = () => {
+      const remaining = localStartAt - performance.now();
+      if (remaining <= 0) {
+        hideOverlay();
+        phase = online.combo.length ? 'playing' : 'waiting';
+        if (!clockOn) {
+          t0 = localStartAt;
+          clockOn = true;
+          tick();
+        }
+        return;
+      }
+
+      phase = 'countdown';
+      if (showCountdown && remaining <= 3000) {
+        const number = Math.min(3, Math.ceil(remaining / 1000));
+        if (number !== shownNumber) {
+          shownNumber = number;
+          showOverlay(`<div class="big" aria-live="assertive">${number}</div><p>Prepara les fletxes</p>`);
+        }
+      } else if (!preparingShown) {
+        preparingShown = true;
+        showOverlay('<h2>Preparant la partida</h2><p>Sincronitzant l’inici…</p>');
+      }
+
+      const number = Math.min(3, Math.ceil(remaining / 1000));
+      const delay = showCountdown
+        ? (remaining <= 3000 ? remaining - (number - 1) * 1000 : remaining - 3000)
+        : remaining;
+      timer = setTimeout(update, Math.max(1, delay));
+    };
+
+    update();
+  }
+
   /** Punts del jugador local segons l'últim marcador rebut. */
   const myScore = () => online.scores.find((s) => s.id === online.id)?.score ?? 0;
 
@@ -385,7 +454,7 @@
   /** Tanca la connexió en línia i ho deixa tot a punt per al mode Entrenament. */
   function leaveOnline() {
     const current = online;
-    if (current) {
+    if (current && !current.eliminated) {
       api(`/rooms/${current.code}/leave`, { player: current.id }).catch((err) => {
         console.error('No s’ha pogut sortir de la sala:', err);
         setStatus('No s’ha pogut sortir de la sala. Comprova la connexió.', 'bad');
@@ -455,12 +524,26 @@
       }
 
       const joined = await api(`/rooms/${code}/join`, { name });
+      let clock;
+      try {
+        clock = await synchronizeClock(code, joined.playerId);
+      } catch (err) {
+        try {
+          await api(`/rooms/${code}/leave`, { player: joined.playerId });
+        } catch (leaveErr) {
+          console.error('No s’ha pogut alliberar la plaça després de l’error de sincronització:', leaveErr);
+        }
+        throw err;
+      }
 
       online = {
         code,
         id: joined.playerId,
         mode: joined.mode,
+        clockOffset: clock.offset,
+        rtt: clock.rtt,
         round: 0,
+        startAt: 0,
         combo: [],
         pos: 0,
         presses: [],
@@ -504,26 +587,23 @@
     });
 
     on('start', (d) => {
-      clearTimeout(timer);
-      phase = 'countdown';
       clockEl.textContent = '0.0 s';
       renderPips(0, online.mode === 'battleRoyale' ? BR_TARGET : CONFIG.target);
       renderCombo(SAMPLE, 0, true);
       setStatus();
-      countdown(d.startsIn / 3); // tres números repartits en el temps que indica el servidor
+      scheduleOnlineStart(d.startAt, true);
     });
 
     on('round', (d) => {
       Object.assign(online, {
         round: d.round,
-        combo: d.combo || [],
         scores: d.scores,
         pos: 0,
-        presses: []
+        presses: [],
+        startAt: d.startAt
       });
+      online.combo = d.combo || (online.mode === 'battleRoyale' ? d.combos?.[myScore()] : []) || [];
 
-      clearTimeout(timer);
-      hideOverlay();
       renderSide();
       renderPips(myScore(), online.mode === 'battleRoyale' ? BR_TARGET : CONFIG.target);
 
@@ -532,17 +612,16 @@
           phase = 'waiting';
           setStatus('Has arribat als 3 punts. Espera els altres jugadors…', 'good');
         } else {
-          phase = 'waiting';
-          setStatus('Esperant la teva combinació…');
+          renderCombo(online.combo, 0);
+          setStatus('Repeteix les tres combinacions en ordre');
         }
       } else {
         renderCombo(d.combo, 0);
         setStatus('Repeteix la combinació');
         announce(d);
-        phase = 'playing';
       }
 
-      if (!clockOn) { t0 = performance.now(); clockOn = true; tick(); }
+      scheduleOnlineStart(d.startAt, d.round === 1);
     });
 
     on('combo', (d) => {
@@ -558,27 +637,32 @@
       renderPips(d.score, BR_TARGET);
       renderCombo(d.combo, 0);
       setStatus('Repeteix la combinació');
-      phase = 'playing';
-
-      if (!clockOn) { t0 = performance.now(); clockOn = true; tick(); }
+      phase = serverNow() >= online.startAt ? 'playing' : 'countdown';
     });
 
     on('eliminated', (d) => {
       online.scores = d.scores;
       renderSide();
+      const eliminated = Array.isArray(d.eliminated) ? d.eliminated : [d.eliminated];
 
-      if (d.eliminated === online.id) {
+      if (eliminated.includes(online.id)) {
+        online.eliminated = true;
         clockOn = false;
         phase = 'result';
         es.close();
 
         showOverlay(
           '<h2>Has quedat eliminat</h2>' +
-          '<p>Has estat l’últim jugador d’aquesta fase.</p>' +
+          '<p>Has quedat eliminat en aquesta fase.</p>' +
           '<button class="btn" data-action="menu">Torna al menú</button>'
         );
       } else {
-        setStatus('Un jugador ha quedat eliminat', 'bad');
+        setStatus(
+          eliminated.length === 1
+            ? 'Un jugador ha quedat eliminat'
+            : `${eliminated.length} jugadors han quedat eliminats`,
+          'bad'
+        );
       }
     });
 
@@ -591,10 +675,14 @@
       phase = 'result';
       es.close();
 
-      const names = d.winners.map((id) => esc(d.scores.find((s) => s.id === id).name)).join(', ');
+      const names = d.winners
+        .map((id) => d.scores.find((s) => s.id === id)?.name)
+        .filter(Boolean)
+        .map(esc)
+        .join(', ');
       showOverlay(
         `<h2>${d.winners.includes(online.id) ? 'Has guanyat!' : 'Partida acabada'}</h2>` +
-        `<p>Guanyador: ${names}</p>` +
+        `<p>${names ? 'Guanyador: ' + names : 'No hi ha guanyador.'}</p>` +
         '<button class="btn" data-action="menu">Torna al menú</button>'
       );
     });
@@ -620,6 +708,7 @@
     const o = online;
     if (dir !== o.combo[o.pos]) { o.pos = 0; o.presses = []; return showFail(); }
 
+    const finishedAt = performance.now();
     o.presses.push(dir);
     updateTiles(++o.pos);
 
@@ -638,9 +727,10 @@
     api(`/rooms/${o.code}/complete`, {
       player: o.id,
       round: o.round,
-      presses: o.presses
+      presses: o.presses,
+      finishedAt
     }).then((d) => {
-      if (online !== o) return;
+      if (online !== o || phase === 'result') return;
 
       if (o.mode === 'battleRoyale') {
         if (d.finished) {
@@ -662,7 +752,7 @@
         }
       }
     }).catch((err) => {
-      if (online !== o || (err.status === 409 && err.message === 'tard')) return;
+      if (online !== o || phase === 'result' || (err.status === 409 && err.message === 'tard')) return;
       console.error('No s’ha pogut enviar la jugada:', err);
       o.pos = 0;
       o.presses = [];
