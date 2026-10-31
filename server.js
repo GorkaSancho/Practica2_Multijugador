@@ -260,8 +260,6 @@ function pruneRooms(now = Date.now()) {
         room.winners?.delete(id);
         room.brFinished?.delete(id);
         room.brFinishTimes?.delete(id);
-        room.brFinishTimes?.delete(id);
-        room.brFinishTimes?.delete(id);
         room.lastScorers = room.lastScorers.filter((scorer) => scorer !== id);
         playersChanged = true;
       }
